@@ -7,7 +7,10 @@ import path from 'node:path';
 import https from 'node:https';
 import dns from 'node:dns';
 import net from 'node:net';
+import { Readable, PassThrough } from 'node:stream';
+import { EventEmitter } from 'node:events';
 import { pipeline } from 'node:stream/promises';
+import { Hono } from 'hono';
 import {
   generateRegistrationOptions, verifyRegistrationResponse,
   generateAuthenticationOptions, verifyAuthenticationResponse
@@ -2963,7 +2966,200 @@ function bodyDeadline(req) {
 // The Capacitor WebView origins of the Android and iOS app.
 const APP_ORIGINS = new Set(['https://localhost', 'capacitor://localhost', 'http://localhost']);
 
-const server = http.createServer(async (req, res) => {
+// Initialize Hono app for Cloudflare Workers & middleware support
+const app = new Hono();
+
+// CORS & PNA middleware in Hono
+app.use('*', async (c, next) => {
+  const origin = c.req.header('origin');
+  if (origin) {
+    c.header('Access-Control-Allow-Origin', origin);
+    c.header('Vary', 'Origin');
+  }
+  if (c.req.method === 'OPTIONS') {
+    const pna = String(c.req.header('access-control-request-private-network') || '').toLowerCase() === 'true'
+      && APP_ORIGINS.has(origin);
+    const headers = {
+      'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE,OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization, CF-Access-Client-Id, CF-Access-Client-Secret',
+      'Access-Control-Max-Age': '86400',
+      ...(pna ? { 'Access-Control-Allow-Private-Network': 'true' } : {})
+    };
+    return c.body(null, 204, headers);
+  }
+  await next();
+});
+
+// MockResponse bridges Node-style res.writeHead() / res.setHeader() / res.write() / res.end() to Web standard Response
+class MockResponse extends EventEmitter {
+  constructor(c, resolve) {
+    super();
+    this.c = c;
+    this.resolve = resolve;
+    this.statusCode = 200;
+    this.headers = new Headers();
+    this.headersSent = false;
+    this.passThrough = new PassThrough();
+
+    // Preserve headers already set on Hono context (such as CORS headers)
+    const origin = c.req.header('origin');
+    if (origin) {
+      this.headers.set('Access-Control-Allow-Origin', origin);
+      this.headers.set('Vary', 'Origin');
+    }
+  }
+  setHeader(name, value) {
+    if (this.headersSent) return;
+    if (Array.isArray(value)) {
+      this.headers.delete(name);
+      for (const item of value) this.headers.append(name, item);
+    } else {
+      this.headers.set(name, value);
+    }
+  }
+  getHeader(name) {
+    return this.headers.get(name);
+  }
+  removeHeader(name) {
+    if (!this.headersSent) this.headers.delete(name);
+  }
+  writeHead(status, headers = {}) {
+    this.statusCode = status;
+    this.headersSent = true;
+    for (const [k, v] of Object.entries(headers)) {
+      if (Array.isArray(v)) for (const item of v) this.headers.append(k, item);
+      else this.headers.set(k, v);
+    }
+    const isNullBody = this.statusCode === 204 || this.statusCode === 304;
+    const webStream = isNullBody ? null : Readable.toWeb(this.passThrough);
+    this.resolve(new Response(webStream, { status: this.statusCode, headers: this.headers }));
+  }
+  write(chunk) {
+    if (!this.headersSent) this.writeHead(this.statusCode);
+    return this.passThrough.write(chunk);
+  }
+  end(chunk) {
+    if (chunk) {
+      if (!this.headersSent) this.writeHead(this.statusCode);
+      this.passThrough.end(chunk);
+    } else {
+      if (!this.headersSent) this.writeHead(this.statusCode);
+      this.passThrough.end();
+    }
+  }
+  destroy() {
+    this.passThrough.destroy();
+  }
+}
+
+// Convert Hono Context into Node-like streamable req when running in Workers environment
+function nodeReqFromHono(c) {
+  const req = c.req.raw.body ? Readable.fromWeb(c.req.raw.body) : new PassThrough();
+  if (!c.req.raw.body) req.end();
+  req.method = c.req.method;
+  const u = new URL(c.req.url);
+  req.url = u.pathname + u.search;
+  req.headers = {};
+  for (const [k, v] of c.req.raw.headers) req.headers[k] = v;
+  req.socket = { remoteAddress: c.req.header('cf-connecting-ip') || '127.0.0.1' };
+  req.destroy = () => { req.emit('error', Object.assign(new Error('destroyed'), { clientGone: true })); };
+  return req;
+}
+
+// Dispatches an incoming request through the route handler with CSRF, throttle, and error handling
+async function handleRoute(c, key, handler) {
+  const req = nodeReqFromHono(c);
+
+  req.params = c.req.param();
+  if (c.req.param('hash')) {
+    req.mediaHash = c.req.param('hash');
+  }
+
+  // URL parsing check
+  const rawUrl = req.url;
+  let url;
+  try { url = new URL(rawUrl, 'http://x'); }
+  catch { return c.json({ error: 'bad request' }, 400, { 'Cache-Control': 'no-store' }); }
+
+  const sent = rawUrl.split('?')[0];
+  if (sent.startsWith('/') && sent !== url.pathname) {
+    return c.json({ error: 'bad request' }, 400, { 'Cache-Control': 'no-store' });
+  }
+
+  // CSRF validation
+  if (!csrfOk(req, key)) {
+    if ((req.headers.authorization || '').startsWith('Bearer ') && !cookieToken(req) && !bearerAuthenticates(req)) {
+      return c.json({ error: 'not signed in' }, 401, { 'Cache-Control': 'no-store' });
+    }
+    console.warn(originHint(key, req.headers.origin, ORIGIN, req.headers['sec-fetch-site']));
+    return c.json({ error: 'cross-origin request refused', code: 'origin-mismatch', expected: ORIGIN }, 403, { 'Cache-Control': 'no-store' });
+  }
+
+  // Throttling
+  if (key in THROTTLED) {
+    const addr = limitAddress(req);
+    const kind = THROTTLED[key];
+    const wait = AUTH_BURST.take(addr) || (kind ? ADDR_FAILS.retryAfter(kind + '|' + addr) : 0);
+    if (wait) {
+      return c.json({ error: 'too many attempts, try again later', code: 'locked', retryAfter: wait }, 429, {
+        'Cache-Control': 'no-store',
+        'Retry-After': String(wait)
+      });
+    }
+  }
+
+  return new Promise(async (resolve) => {
+    const res = new MockResponse(c, resolve);
+    try {
+      await handler(req, res);
+    } catch (e) {
+      if (e?.clientGone) {
+        console.warn(key, 'client went away mid-body:', e.message);
+        resolve(new Response(null, { status: 499 }));
+        return;
+      }
+      if (e instanceof HttpError) {
+        if (!res.headersSent) json(res, e.status, { error: e.message });
+        return;
+      }
+      if (e instanceof MediaError) {
+        if (!res.headersSent) json(res, e.status, { error: e.message, code: e.code, ...e.extra }, e.headers);
+        return;
+      }
+      if (e instanceof BusyError) {
+        if (!res.headersSent) json(res, 503, { error: 'the server is busy, try again in a moment', code: 'busy' }, { 'Retry-After': '2' });
+        return;
+      }
+      console.error(key, e);
+      if (!res.headersSent) json(res, 500, { error: 'server error' });
+    }
+  });
+}
+
+// Map registered routes to Hono
+for (const [key, handler] of Object.entries(routes)) {
+  const [method, routePath] = key.split(' ');
+  const honoPath = routePath.replace(/\{hash\}/g, ':hash{[0-9a-f]{64}}').replace(/\{([^}]+)\}/g, ':$1');
+  const honoHandler = (c) => handleRoute(c, key, handler);
+  const m = method.toLowerCase();
+  if (m === 'get') app.get(honoPath, honoHandler);
+  else if (m === 'post') app.post(honoPath, honoHandler);
+  else if (m === 'put') app.put(honoPath, honoHandler);
+  else if (m === 'delete') app.delete(honoPath, honoHandler);
+}
+
+app.notFound((c) => c.json({ error: 'not found' }, 404, { 'Cache-Control': 'no-store' }));
+
+export default app;
+
+const isStandaloneNode = typeof process !== 'undefined'
+  && process.release?.name === 'node'
+  && !navigator?.userAgent?.includes('Cloudflare-Workers');
+
+let server = null;
+
+if (isStandaloneNode) {
+  server = http.createServer(async (req, res) => {
   bodyDeadline(req);
   // Same-origin (the deployed nginx-proxied web app) never triggers CORS, so this only matters
   // for the paired mobile app calling in from its own WebView origin. It carries no cookie
@@ -3082,3 +3278,4 @@ startAdminSocket({
     return { ...row(u), code, expires: link.exp };
   }
 });
+}

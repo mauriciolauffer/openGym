@@ -1,0 +1,15 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "opengym-api",
+  "main": "server.js",
+  "compatibility_date": "2024-09-23",
+  "compatibility_flags": [
+    "nodejs_compat"
+  ],
+  "vars": {
+    "RP_ID": "localhost",
+    "ORIGIN": "http://localhost:8080",
+    "RP_NAME": "openGym",
+    "DATA_DIR": "/tmp/opengym"
+  }
+}
